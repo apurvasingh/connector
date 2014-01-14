@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 import sys
 import platform
 import os
@@ -10,6 +10,7 @@ import threading
 import ast
 import time
 import signal
+import datetime
 
 import cpapi
 import cputils
@@ -1031,7 +1032,7 @@ def writeConfigFile(filename, timestampList):
     try:
         fp = open(filename, "w")
         for entry in timestampList:
-            if ('id' in entry) and ('timestamp' in entry):
+            if ('id' in entry) and ('timestamp' in entry) and (entry['timestamp'] != None):
                 fp.write("%s|%s\n" % (entry['id'], entry['timestamp']))
         fp.close()
     except IOError as e:
@@ -1065,10 +1066,10 @@ def writeTimestamp(filename, credentialList):
     if ('redis' == metadataDestination):
         writeRedisConfig(credentialList)
     else:
-        writeConfigFile(configFilename, credentialList)
+        writeConfigFile(filename, credentialList)
 
 
-def processEventBatches(apiCon,credential,timestampMap,credentialList):
+def processEventBatches(apiCon,credential,timestampMap,credentialList,configFilename):
     global shouldExit
     (apiCon.key_id, apiCon.secret) = (credential['id'], credential['secret'])
 
@@ -1084,6 +1085,7 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList):
         connLastTimestamp = timestampMap[credential['id']]
     else:
         connLastTimestamp = lastTimestamp  # handle timestamp per-connection
+    lastEventTimestamp = None
 
     # Now, turn key and secret into an authentication token (usually only good
     #   for 15 minutes or so) by logging in to the REST API server.
@@ -1110,10 +1112,12 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList):
         else:
             # If we received a batch of events, send them to the destination.
             (nextLink, connLastTimestamp) = dumpEvents(batch)
+            lastEventTimestamp = connLastTimestamp
             # After each batch, write out config file with latest timestamp (from events),
             #   so that if we get interrupted during the next batch, we can resume from this point.
-            credential['timestamp'] = connLastTimestamp
-            writeTimestamp(configFilename, credentialList)
+            if (connLastTimestamp != None):
+                credential['timestamp'] = connLastTimestamp
+                writeTimestamp(configFilename, credentialList)
             # print "NextLink: %s\t\t%s" % (nextLink, connLastTimestamp)
             # time.sleep(1000) # for testing only
             if (metadataDestination == 'redis'):
@@ -1125,9 +1129,14 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList):
         #   so we don't always re-output the last event (REST API timestamp
         #   comparison is inclusive, so it returns events whose timestamp is
         #   later-than-or-equal-to the provided timestamp).
-        connLastTimestamp = cputils.getNowAsISO8601()
-        credential['timestamp'] = connLastTimestamp
-        writeTimestamp(configFilename, credentialList)
+        if (connLastTimestamp != None) and (lastEventTimestamp != None):
+            timeObj = cputils.strToDate(connLastTimestamp)
+            if (timeObj != None):
+                oneMicrosecond = datetime.timedelta(0,0,1)
+                newTimeObj = timeObj + oneMicrosecond
+                connLastTimestamp = cputils.formatTimeAsISO8601(newTimeObj)
+            credential['timestamp'] = connLastTimestamp
+            writeTimestamp(configFilename, credentialList)
 
 
 def processAllAccounts(authFilenameList):
@@ -1165,7 +1174,7 @@ def processAllAccounts(authFilenameList):
                 if verbose:
                     print >> sys.stderr, "Using Port: %s" % apiCon.port
             apiConnections.append(apiCon)
-            processEventBatches(apiCon,credential,timestampMap,credentialList)
+            processEventBatches(apiCon,credential,timestampMap,credentialList,configFilename)
             if (shouldExit):
                 break
 
