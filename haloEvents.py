@@ -90,6 +90,9 @@ s3conn = None
 s3lock = 'lock'
 eventCountLimit = None
 batchWaitTime = None
+threadCount = 0
+outputQueue = {}
+threadList = {}
 
 # config vars for optional redis output
 redis_host = None
@@ -377,6 +380,7 @@ def processCmdLineArgs(argv):
     global oneEventPerLine, verbose, outputFormat, outputDestination, lastTimestamp, configDir, syslogInfo
     global redis_host, redis_port, metadataDestination, useHA, apiURL, apiPort
     global botoAvailable, configOnS3, bucketName, eventCountLimit, batchWaitTime
+    global threadCount
     argsOK = True
     for arg in argv:
         if ((arg == '-?') or (arg == "-h")):
@@ -420,6 +424,8 @@ def processCmdLineArgs(argv):
             if not botoAvailable:
                 print >> sys.stderr, "Boto library not available, check PYTHONPATH?"
                 return True
+        elif (arg.startswith('--threads=')):
+            threadCount = int(arg.split('=')[1])
         elif (arg.startswith('--jsonfile=')):
             outputFormat = 'json-file'
             outputDestination = arg[11:]
@@ -627,6 +633,7 @@ def printUsage(progName):
     print >> sys.stderr, "--starting=<time>\tSpecify start of event time range in ISO-8601 format"
     print >> sys.stderr, "--limit=<count>\t\tOnly process <count> events before exiting"
     print >> sys.stderr, "--sleep=<seconds>\tWait <seconds> after each batch of events"
+    print >> sys.stderr, "--threads=<num>\t\tStart num threads each reading pages of events in parallel"
     print >> sys.stderr, "--configdir=<dir>\tSpecify directory for configration files (saved timestamps)"
     if botoAvailable:
         print >> sys.stderr, "--configdir=S3\t\tSpecify an S3 bucket should be used for storing config"
@@ -1095,7 +1102,61 @@ def dumpEvents(json_str):
         the next batch of events) and the event list. The event list is passed
         to formatEvents() to be formatted and sent to the desired output.
     """
+    timestampKey = 'created_at'
+    paginationKey = 'pagination'
+    nextKey = 'next'
+    eventsKey = 'events'
+    obj = json.loads(json_str)
+    nextLink = None
+    lastTimestamp = None
+    if (paginationKey in obj):
+        pagination = obj[paginationKey]
+        if ((pagination) and (nextKey in pagination)):
+            nextLink = pagination[nextKey]
+    if (eventsKey in obj):
+        eventList = obj[eventsKey]
+        internalDumpEvents(eventList)
+        numEvents = len(eventList)
+        if (numEvents > 0):
+            lastEvent = eventList[numEvents - 1]
+            if (timestampKey in lastEvent):
+                lastTimestamp = lastEvent[timestampKey]
+    return (nextLink, lastTimestamp)
+
+
+def internalDumpEvents(eventList):
+    """ Parses a JSON response to the request for an event batch.
+
+        The requests contains an outer wrapper object, with pagination info
+        and a list of events. We extract the pagination info (contains a link to
+        the next batch of events) and the event list. The event list is passed
+        to formatEvents() to be formatted and sent to the desired output.
+    """
     global eventCountLimit
+    timestampKey = 'created_at'
+    lastTimestamp = None
+    numEvents = len(eventList)
+    if (eventCountLimit != None):
+        if (numEvents > eventCountLimit):
+            eventList = eventList[0:eventCountLimit]
+            numEvents = len(eventList)
+        eventCountLimit -= numEvents
+    if (numEvents > 0):
+        lastEvent = eventList[numEvents - 1]
+        if (timestampKey in lastEvent):
+            lastTimestamp = lastEvent[timestampKey]
+    if useHA:
+        writeToRedis(eventList)
+    else:
+        formatEvents(eventList)
+    return lastTimestamp
+
+
+def queueEvents(json_str,pageNum):
+    """ Adds batch of events to a queue waiting to be output in proper order
+
+        First, parses the events
+    """
     timestampKey = 'created_at'
     paginationKey = 'pagination'
     nextKey = 'next'
@@ -1110,15 +1171,7 @@ def dumpEvents(json_str):
     if (eventsKey in obj):
         eventList = obj[eventsKey]
         numEvents = len(eventList)
-        if (eventCountLimit != None):
-            if (numEvents > eventCountLimit):
-                eventList = eventList[0:eventCountLimit]
-                numEvents = len(eventList)
-            eventCountLimit -= numEvents
-        if useHA:
-            writeToRedis(eventList)
-        else:
-            formatEvents(eventList)
+        outputQueue["%d" % pageNum] = eventList
         if (numEvents > 0):
             lastEvent = eventList[numEvents - 1]
             if (timestampKey in lastEvent):
@@ -1212,7 +1265,40 @@ def writeTimestamp(filename, credentialList):
         writeConfigFile(filename, credentialList)
 
 
+def parseURL(url):
+    tops = url.split("?")
+    base = tops[0]
+    params = []
+    if (len(tops) > 1):
+        query = tops[1]
+        params = query.split("&")
+    return { 'base': base, 'params': params }
+
+
+def changePageInURL(url, newPageNum):
+    parsed = parseURL(url)
+    query = ""
+    matched = False
+    for param in parsed['params']:
+        if (len(query) > 0):
+            query += "&"
+        if (param.startswith('page=')):
+            matched = True
+            query += "page=%d" % newPageNum
+        else:
+            query += param
+    if (not matched):
+        if (len(query) > 0):
+            query += "&"
+        query += "page=%d" % newPageNum
+    return parsed['base'] + '?' + query
+
+
 def processEventBatches(apiCon,credential,timestampMap,credentialList,configFilename):
+    return processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,configFilename,-1,-1)
+
+
+def processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,configFilename,start,increment):
     global shouldExit, eventCountLimit, batchWaitTime
     (apiCon.key_id, apiCon.secret) = (credential['id'], credential['secret'])
 
@@ -1237,37 +1323,58 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList,configFile
         # no error message here, rely on cpapi.authenticate client for error message
         sys.exit(1)
 
+    pageNum = start
     # Now, prep the destination for events (open file, or connect to syslog server).
     openOutput()
     # Decide on the initial URL used for fetching events.
     nextLink = apiCon.getInitialLink(connLastTimestamp, events_per_page)
+    if (pageNum >= 0):
+        nextLink = changePageInURL(nextLink,pageNum)
 
+    retryCount = 0
     # Now, enter a "while more events available" loop.
     while (nextLink) and (not shouldExit) and ((eventCountLimit == None) or (eventCountLimit > 0)):
-        (batch, authError) = apiCon.getEventBatch(nextLink)
-        if (authError):
-            # An auth error is likely to happen if our token expires (after 15 minutes or so).
-            # If so, we try to renew our session by logging in again (gets a new token).
-            resp = apiCon.authenticateClient()
-            if (not resp):
-                print >> sys.stderr, "Failed to retrieve authentication token. Exiting..."
-                sys.exit(1)
-        else:
-            # If we received a batch of events, send them to the destination.
-            (nextLink, connLastTimestamp) = dumpEvents(batch)
-            lastEventTimestamp = connLastTimestamp
-            # After each batch, write out config file with latest timestamp (from events),
-            #   so that if we get interrupted during the next batch, we can resume from this point.
-            if (connLastTimestamp != None):
-                credential['timestamp'] = connLastTimestamp
-                writeTimestamp(configFilename, credentialList)
-            # print "NextLink: %s\t\t%s" % (nextLink, connLastTimestamp)
-            # time.sleep(1000) # for testing only
-            if (metadataDestination == 'redis'):
-                renewRedisLock()
-            # sleep after each batch, if requested
-            if (batchWaitTime != None):
-                time.sleep(batchWaitTime)
+        try:
+            (batch, authError) = apiCon.getEventBatch(nextLink)
+            if (authError):
+                # An auth error is likely to happen if our token expires (after 15 minutes or so).
+                # If so, we try to renew our session by logging in again (gets a new token).
+                resp = apiCon.authenticateClient()
+                if (not resp):
+                    print >> sys.stderr, "Failed to retrieve authentication token. Exiting..."
+                    sys.exit(1)
+            else:
+                # If we received a batch of events, send them to the destination.
+                if (increment > 0):
+                    (nextLink, connLastTimestamp) = queueEvents(batch,pageNum)
+                else:
+                    (nextLink, connLastTimestamp) = dumpEvents(batch)
+                lastEventTimestamp = connLastTimestamp
+                # After each batch, write out config file with latest timestamp (from events),
+                #  so that if we get interrupted during the next batch, we can resume from this point.
+                if (connLastTimestamp != None) and (increment < 1):
+                    credential['timestamp'] = connLastTimestamp
+                    writeTimestamp(configFilename, credentialList)
+                # print "NextLink: %s\t\t%s" % (nextLink, connLastTimestamp)
+                # time.sleep(1000) # for testing only
+                if (metadataDestination == 'redis'):
+                    renewRedisLock()
+                # sleep after each batch, if requested
+                if (batchWaitTime != None):
+                    time.sleep(batchWaitTime)
+                retryCount = 0 # after successful event-retrieval, reset count of retries
+                if (nextLink != None) and (pageNum >= 0) and (increment > 0):
+                    pageNum += increment
+                    nextLink = changePageInURL(nextLink,pageNum)
+        except (IOError, TypeError) as e:
+            # should log exact error for debugging purposes
+            if (retryCount < 3):
+                retryCount += 1
+                time.sleep(5) # sleep 5 seconds in case
+                print >> sys.stderr, "Non-fatal error, retrying"
+            else:
+                print >> sys.stderr, "Non-fatal error, too many retries, exiting"
+                break # exit loop, end stream, and rewrite check-point (if we got ANY events)
 
     # only do this if we weren't shut down prematurely
     if (not shouldExit):
@@ -1275,7 +1382,7 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList,configFile
         #   so we don't always re-output the last event (REST API timestamp
         #   comparison is inclusive, so it returns events whose timestamp is
         #   later-than-or-equal-to the provided timestamp).
-        if (connLastTimestamp != None) and (lastEventTimestamp != None):
+        if (connLastTimestamp != None) and (lastEventTimestamp != None) and (increment < 1):
             timeObj = cputils.strToDate(connLastTimestamp)
             if (timeObj != None):
                 oneMicrosecond = datetime.timedelta(0,0,1)
@@ -1285,7 +1392,7 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList,configFile
             writeTimestamp(configFilename, credentialList)
 
 
-def processAllAccounts(authFilenameList):
+def processAllAccounts(authFilenameList,threadCount):
     global shouldExit, configOnS3, bucketName
     if (len(authFilenameList) == 0):
         authFilenameList = [authFilenameDefault]
@@ -1323,7 +1430,18 @@ def processAllAccounts(authFilenameList):
                 if verbose:
                     print >> sys.stderr, "Using Port: %s" % apiCon.port
             apiConnections.append(apiCon)
-            processEventBatches(apiCon,credential,timestampMap,credentialList,configFilename)
+            if (threadCount > 0):
+                args = { 'apiCon': apiCon, 'credential': credential, 'timestampMap': timestampMap,
+                         'credentialList': credentialList, 'configFilename': configFilename }
+                threadIndex = 0
+                while (threadIndex < threadCount):
+                    thread = ParallelThread(threadIndex + 1, threadCount, args)
+                    thread.start()
+                    threadIndex += 1
+                thread = QueueOutputThread(credential,credentialList,configFilename)
+                thread.start()
+            else:
+                processEventBatches(apiCon,credential,timestampMap,credentialList,configFilename)
             if (shouldExit):
                 break
 
@@ -1335,7 +1453,7 @@ class SourceThread(threading.Thread):
 
     def run(self):
         global shouldExit
-        processAllAccounts(self.authFilenameList)
+        processAllAccounts(self.authFilenameList,0)
         shouldExit = True
 
 
@@ -1350,6 +1468,59 @@ class ConsumerThread(threading.Thread):
             retrieveEventsFromRedis()
         time.sleep(2)
         retrieveEventsFromRedis()
+
+
+class ParallelThread(threading.Thread):
+    def __init__(self,start,increment,args):
+        global threadList
+        threading.Thread.__init__(self)
+        self.authFilenameList = authFilenameList
+        self.startPage = start
+        self.pageIncrement = increment
+        self.argsObj = args
+        threadList["%d" % start] = self
+
+    def run(self):
+        # print "Fetching page: %d [thread = %d]" % (pageNum, self.startPage)
+        processEventBatchesByPages(self.argsObj['apiCon'],self.argsObj['credential'],self.argsObj['timestampMap'],
+                                   self.argsObj['credentialList'],self.argsObj['configFilename'],
+                                   self.startPage,self.pageIncrement)
+        threadList.pop("%d" % self.startPage,None)
+
+
+class QueueOutputThread(threading.Thread):
+    def __init__(self, credential, credentialList, configFilename):
+        threading.Thread.__init__(self)
+        self.credential = credential
+        self.credentialList = credentialList
+        self.configFilename = configFilename
+
+    def run(self):
+        global threadList, outputQueue, shouldExit, configFilename
+        pageNum = 1
+        lastTimestamp = None
+        # print >>sys.stderr, threadList
+        while (len(threadList) > 0) or (len(outputQueue) > 0) and (not shouldExit):
+            key = "%d" % pageNum
+            if (key in outputQueue):
+                tmpTimestamp = internalDumpEvents(outputQueue[key])
+                outputQueue.pop(key,None)
+                pageNum += 1
+                if (tmpTimestamp != None):
+                    lastTimestamp = tmpTimestamp
+                    self.credential['timestamp'] = lastTimestamp
+                    writeTimestamp(self.configFilename, self.credentialList)
+            else:
+                time.sleep(0.1)
+        # print >>sys.stderr, "Exiting queue consumer thead"
+        if (not shouldExit) and (lastTimestamp != None):
+            timeObj = cputils.strToDate(lastTimestamp)
+            if (timeObj != None):
+                oneMicrosecond = datetime.timedelta(0,0,1)
+                newTimeObj = timeObj + oneMicrosecond
+                lastTimestamp = cputils.formatTimeAsISO8601(newTimeObj)
+            self.credential['timestamp'] = lastTimestamp
+            writeTimestamp(self.configFilename, self.credentialList)
 
 
 def interruptHandler(signum, frame):
@@ -1385,7 +1556,7 @@ else:
 
 catchCtrlC()
 if (not useHA):
-    processAllAccounts(authFilenameList)
+    processAllAccounts(authFilenameList,threadCount)
 else:
     srcThread = SourceThread(authFilenameList)
     dstThread = ConsumerThread()
