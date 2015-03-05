@@ -1386,8 +1386,9 @@ def processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,con
         if (connLastTimestamp != None) and (lastEventTimestamp != None) and (increment < 1):
             timeObj = cputils.strToDate(connLastTimestamp)
             if (timeObj != None):
-                oneMicrosecond = datetime.timedelta(0,0,1)
-                newTimeObj = timeObj + oneMicrosecond
+                # delta = datetime.timedelta(0,0,1) # one microsecond
+                delta = datetime.timedelta(0,1,0) # one millisecond
+                newTimeObj = timeObj + delta
                 connLastTimestamp = cputils.formatTimeAsISO8601(newTimeObj)
             credential['timestamp'] = connLastTimestamp
             writeTimestamp(configFilename, credentialList)
