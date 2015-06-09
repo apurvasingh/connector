@@ -70,7 +70,11 @@ def processAuthFile(filename, progDir):
         if not str.startswith("#"):
             fields = str.split("|")
             if (len(fields) == 2):
-                if (len(credentials) < 5):
+                if (len(fields[0]) < 1):
+                    print >> sys.stderr, "No ID field found: %s" % str
+                elif (len(fields[1]) < 1):
+                    print >> sys.stderr, "No secret field found: %s" % str
+                elif (len(credentials) < 5):
                     credential = {'id': fields[0], 'secret': fields[1]}
                     credentials.append(credential)
                 else:
@@ -81,6 +85,20 @@ def processAuthFile(filename, progDir):
         return (credentials, None)
 
 
+def validateURL(url):
+    url_regex = "https://([-A-Za-z0-9_.]+)[.]([-A-Za-z0-9_]+[.][-A-Za-z0-9_]+)"
+    m = re.match(url_regex,url)
+    if (m == None):
+        return (False, "Illegal URL format")
+    hostname = m.group(1)
+    domain = m.group(2)
+    if (domain != "cloudpassage.com"):
+        return (False, "%s is not allowed as domain, must use cloudpassage.com" % domain)
+    if (hostname == "www"):
+        return (False, "www is not allowed as hostname")
+    return (True, "")
+
+
 def strToDate(str):
     # assumes a UTC/ISO8601 date/time string (e.g. "2012-08-12T21:39:40.740301Z")
     return datetime.datetime.strptime( str, "%Y-%m-%dT%H:%M:%S.%fZ" )
@@ -89,10 +107,34 @@ def strToDate(str):
 def verifyISO8601(tstr):
     if (tstr == None) or (len(tstr) == 0):
         return (False, "Empty timestamp, ISO8601 format required")
-    iso_regex = "\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{4})?)?$"
+    iso_regex = "(\d{4})-(\d{2})-(\d{2})(T(\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?(Z|[+-]\d{4})?)?$"
     m = re.match(iso_regex, tstr)
     if (m == None):
         return (False, "Timestamp (%s) does not match ISO8601 format" % tstr)
+    year = m.group(1)
+    month = m.group(2)
+    day = m.group(3)
+    hour = m.group(5)
+    minute = m.group(6)
+    second = m.group(7)
+    if (year == None) or (int(year) < 1900) or (int(year) > 2100):
+        return (False, "Invalid year (%s)" % year)
+    if (month == None) or (int(month) < 1) or (int(month) > 12):
+        return (False, "Invalid month (%s)" % month)
+    if (day == None) or (int(day) < 1) or (int(day) > 31):
+        return (False, "Invalid day of month (%s)" % day)
+    if (hour != None):
+        if (int(hour) < 0) or (int(hour) > 23):
+            return (False, "Invalid hour (%s)" % hour)
+        if (minute != None):
+            if (int(minute) < 0) or (int(minute) > 59):
+                return (False, "Invalid minute (%s)" % minute)
+            if (second != None):
+                if (int(second) < 0) or (int(second) > 59):
+                    return (False, "Invalid second (%s)" % second)
+    now = getNowAsISO8601()
+    if (now < tstr):
+        return (False, "Timestamp (%s) is in the future" % tstr)
     return (True, "")
 
 

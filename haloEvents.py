@@ -405,10 +405,23 @@ def processCmdLineArgs(argv):
                 authFilenameList.append(filename)
         elif (arg.startswith('--url=')):
             apiURL = arg[6:]
-            print >> sys.stderr, "Using URL: %s" % apiURL
+            (ok, msg) = cputils.validateURL(apiURL)
+            if (not ok):
+                print >> sys.stderr, "%s: %s" % (msg, apiURL)
+                argsOK = False
+            else:
+                print >> sys.stderr, "Using URL: %s" % apiURL
         elif (arg.startswith('--port=')):
-            apiPort = int(arg[7:])
-            print >> sys.stderr, "Using Port: %s" % apiPort
+            try:
+                apiPort = int(arg[7:])
+                if (apiPort < 1) or (apiPort > 65535):
+                    print >> sys.stderr, "Illegal port value: %d (must be 1-65535)" % apiPort
+                    argsOK = False
+                else:
+                    print >> sys.stderr, "Using Port: %d" % apiPort
+            except ValueError:
+                print >> sys.stderr, "Invalid port value: %s" % arg.split('=')[1]
+                argsOK = False
         elif (arg.startswith('--cfgdir=') or arg.startswith('--configdir=')):
             i = arg.index('=') + 1
             configDir = arg[i:]
@@ -425,7 +438,14 @@ def processCmdLineArgs(argv):
                 print >> sys.stderr, "Boto library not available, check PYTHONPATH?"
                 return True
         elif (arg.startswith('--threads=')):
-            threadCount = int(arg.split('=')[1])
+            try:
+                threadCount = int(arg.split('=')[1])
+                if (threadCount < 1) or (threadCount > 30):
+                    print >> sys.stderr, "Illegal number of threads: %d (must be between 1 and 30)" % threadCount
+                    argsOK = False
+            except ValueError:
+                print >> sys.stderr, "Invalid threads value: %s" % arg.split('=')[1]
+                argsOK = False
         elif (arg.startswith('--jsonfile=')):
             outputFormat = 'json-file'
             outputDestination = arg[11:]
@@ -523,7 +543,14 @@ def processCmdLineArgs(argv):
             metadataDestination = 'redis'
             useHA = True
         elif (arg.startswith('--limit=')):
-            eventCountLimit = int(arg.split('=')[1])
+            try:
+                eventCountLimit = int(arg.split('=')[1])
+                if (eventCountLimit < 1) or (eventCountLimit > 20):
+                    print >> sys.stderr, "Illegal limit value: %d (must be between 1 and 20)" % eventCountLimit
+                    argsOK = False
+            except ValueError:
+                print >> sys.stderr, "Invalid limit value: %s" % arg.split('=')[1]
+                argsOK = False
         elif (arg.startswith('--sleep=')):
             batchWaitTime = float(arg.split('=')[1])
         elif (arg != argv[0]):
