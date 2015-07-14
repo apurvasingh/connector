@@ -5,7 +5,8 @@ import json
 import urllib
 import urllib2
 import base64
-
+import threading
+import datetime
 
 # Class with calls to CloudPassage API
 class CPAPI:
@@ -18,6 +19,9 @@ class CPAPI:
         self.key_id = None
         self.secret = None
         self.authToken = None
+        self.lock = threading.RLock()
+        self.api_count = 0
+        self.api_time = 0.0
 
     # Dump debug info
     def dumpToken(self, token, expires):
@@ -82,10 +86,23 @@ class CPAPI:
     def getEventBatch(self, url):
         return self.doGetRequest(url, self.authToken)
 
+    def logTime(self, start_time, end_time):
+        delta = end_time - start_time
+        with self.lock:
+            self.api_count += 1
+            self.api_time += delta.total_seconds()
+
+    def getTimeLog(self):
+        tuple = None
+        with self.lock:
+            tuple = (self.api_count, self.api_time)
+        return tuple
+
     def doGetRequest(self, url, token):
         req = urllib2.Request(url)
         req.add_header("Authorization", "Bearer " + token)
         try:
+            start_time = datetime.datetime.now()
             fh = urllib2.urlopen(req)
             data = fh.read()
             contentType = fh.info().getheader('Content-type')
@@ -93,12 +110,14 @@ class CPAPI:
             # print >> sys.stderr, "Type=%s  Encoding=%s" % (mimetype, encoding)
             translatedData = data.decode(encoding,'ignore').encode('utf-8')
             results = (translatedData, False)
+            end_time = datetime.datetime.now()
+            self.logTime(start_time, end_time)
             return results
         except IOError, e:
             authError = False
             if hasattr(e, 'reason'):
                 print >> sys.stderr, "Failed to connect [%s] to '%s'" % (e.reason, url)
-		if (e.reason == "Unauthorized"):
+                if (e.reason == "Unauthorized"):
                     authError = True
             elif hasattr(e, 'code'):
                 msg = self.getHttpStatus(e.code)
@@ -117,8 +136,12 @@ class CPAPI:
         req.add_header("Content-Type", "application/json")
         req.get_method = lambda: 'PUT'
         try:
+            start_time = datetime.datetime.now()
             fh = opener.open(req)
-            return (fh.read(), False)
+            results = (fh.read(), False)
+            end_time = datetime.datetime.now()
+            self.logTime(start_time, end_time)
+            return results
         except IOError, e:
             authError = False
             if hasattr(e, 'reason'):
@@ -139,8 +162,12 @@ class CPAPI:
         req.add_header("Authorization", "Bearer " + token)
         req.add_header("Content-Type", "application/json")
         try:
+            start_time = datetime.datetime.now()
             fh = opener.open(req)
-            return (fh.read(), False)
+            results = (fh.read(), False)
+            end_time = datetime.datetime.now()
+            self.logTime(start_time, end_time)
+            return results
         except IOError, e:
             authError = False
             if hasattr(e, 'reason'):

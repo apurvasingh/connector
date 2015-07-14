@@ -22,13 +22,13 @@ import os.path
 import json
 
 # Here, we simultaneously check for which OS (all non-Windows OSs are treated equally) we have.
-isWindows = True
-if (platform.system() != "Windows"):
-    isWindows = False
-    import cpsyslog
-    if sys.stdout.encoding == None:
-        # this indicates we're sending to a pipe, and need to force terminal encoding
-        sys.stdout = codecs.getwriter(locale.getpreferredencoding())(sys.stdout)
+#isWindows = True
+#if (platform.system() != "Windows"):
+#    isWindows = False
+#    import cpsyslog
+#    if sys.stdout.encoding == None:
+#        # this indicates we're sending to a pipe, and need to force terminal encoding
+#        sys.stdout = codecs.getwriter(locale.getpreferredencoding())(sys.stdout)
 
 # Now we check for whether the extra modules needed for syslog functionality are present.
 syslogAvailable = True
@@ -78,6 +78,7 @@ else:
 outputFormat = "json-file"
 outputDestination = None
 metadataDestination = 'file'
+totalEventCount = 0
 useHA = False
 syslogOpen = False
 syslogInfo = None
@@ -93,6 +94,11 @@ batchWaitTime = None
 threadCount = 0
 outputQueue = {}
 threadList = {}
+showProgress = False
+
+# tells program to reset page number after this many pages (and use "since" argument)
+pageBatchSize = None
+batchSinceTime = {}
 
 # config vars for optional redis output
 redis_host = None
@@ -380,7 +386,7 @@ def processCmdLineArgs(argv):
     global oneEventPerLine, verbose, outputFormat, outputDestination, lastTimestamp, configDir, syslogInfo
     global redis_host, redis_port, metadataDestination, useHA, apiURL, apiPort
     global botoAvailable, configOnS3, bucketName, eventCountLimit, batchWaitTime
-    global threadCount
+    global threadCount, showProgress, pageBatchSize
     argsOK = True
     for arg in argv:
         if ((arg == '-?') or (arg == "-h")):
@@ -442,6 +448,17 @@ def processCmdLineArgs(argv):
                 threadCount = int(arg.split('=')[1])
                 if (threadCount < 1) or (threadCount > 30):
                     print >> sys.stderr, "Illegal number of threads: %d (must be between 1 and 30)" % threadCount
+                    argsOK = False
+            except ValueError:
+                print >> sys.stderr, "Invalid threads value: %s" % arg.split('=')[1]
+                argsOK = False
+        elif (arg == "--progress"):
+            showProgress = True
+        elif (arg.startswith('--batchsize=')):
+            try:
+                pageBatchSize = int(arg.split('=')[1])
+                if (pageBatchSize < 1):
+                    print >> sys.stderr, "Illegal page batch size: %d (must be 1 or higher)" % pageBatchSize
                     argsOK = False
             except ValueError:
                 print >> sys.stderr, "Invalid threads value: %s" % arg.split('=')[1]
@@ -661,6 +678,8 @@ def printUsage(progName):
     print >> sys.stderr, "--limit=<count>\t\tOnly process <count> events before exiting"
     print >> sys.stderr, "--sleep=<seconds>\tWait <seconds> after each batch of events"
     print >> sys.stderr, "--threads=<num>\t\tStart num threads each reading pages of events in parallel"
+    print >> sys.stderr, "--progress\t\tPrint progress reports to stderr (includes API statistics)"
+    print >> sys.stderr, "--batchsize=<num>\tSpecify a limit for page numbers, after which we use 'since'"
     print >> sys.stderr, "--configdir=<dir>\tSpecify directory for configration files (saved timestamps)"
     if botoAvailable:
         print >> sys.stderr, "--configdir=S3\t\tSpecify an S3 bucket should be used for storing config"
@@ -1152,7 +1171,7 @@ def dumpEvents(json_str):
     return (nextLink, lastTimestamp)
 
 
-def internalDumpEvents(eventList):
+def internalDumpEvents(eventList,apiCon = None):
     """ Parses a JSON response to the request for an event batch.
 
         The requests contains an outer wrapper object, with pagination info
@@ -1160,7 +1179,7 @@ def internalDumpEvents(eventList):
         the next batch of events) and the event list. The event list is passed
         to formatEvents() to be formatted and sent to the desired output.
     """
-    global eventCountLimit
+    global eventCountLimit, showProgress, totalEventCount
     timestampKey = 'created_at'
     lastTimestamp = None
     numEvents = len(eventList)
@@ -1170,9 +1189,17 @@ def internalDumpEvents(eventList):
             numEvents = len(eventList)
         eventCountLimit -= numEvents
     if (numEvents > 0):
+        totalEventCount += numEvents
         lastEvent = eventList[numEvents - 1]
         if (timestampKey in lastEvent):
             lastTimestamp = lastEvent[timestampKey]
+    if (showProgress):
+        now = datetime.datetime.utcnow()
+        if (apiCon != None):
+            (api_count, api_time) = apiCon.getTimeLog()
+        else:
+            (api_count, api_time) = (0, 0.0)
+        print >>sys.stderr, "%s   %d  %g/%d=%g" % ( now, totalEventCount, api_time, api_count, (api_time / api_count) )
     if useHA:
         writeToRedis(eventList)
     else:
@@ -1303,22 +1330,30 @@ def parseURL(url):
     return { 'base': base, 'params': params }
 
 
-def changePageInURL(url, newPageNum):
+def changePageInURL(url, newPageNum, sinceTime):
     parsed = parseURL(url)
     query = ""
-    matched = False
+    pageMatched = False
+    sinceMatched = False
     for param in parsed['params']:
         if (len(query) > 0):
             query += "&"
         if (param.startswith('page=')):
-            matched = True
+            pageMatched = True
             query += "page=%d" % newPageNum
+        elif (param.startswith("since=")) and (sinceTime != None):
+            sinceMatched = True
+            query += "since=%s" % sinceTime
         else:
             query += param
-    if (not matched):
+    if (not pageMatched):
         if (len(query) > 0):
             query += "&"
         query += "page=%d" % newPageNum
+    if (not sinceMatched) and (sinceTime != None):
+        if (len(query) > 0):
+            query += "&"
+        query += "since=%s" % sinceTime
     return parsed['base'] + '?' + query
 
 
@@ -1327,7 +1362,7 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList,configFile
 
 
 def processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,configFilename,start,increment):
-    global shouldExit, eventCountLimit, batchWaitTime
+    global shouldExit, eventCountLimit, batchWaitTime, pageBatchSize, batchSinceTime
     (apiCon.key_id, apiCon.secret) = (credential['id'], credential['secret'])
 
     # Check that we have a key and secret. Must be obtained either in an auth file,
@@ -1357,7 +1392,7 @@ def processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,con
     # Decide on the initial URL used for fetching events.
     nextLink = apiCon.getInitialLink(connLastTimestamp, events_per_page)
     if (pageNum >= 0):
-        nextLink = changePageInURL(nextLink,pageNum)
+        nextLink = changePageInURL(nextLink,pageNum,None)
 
     retryCount = 0
     # Now, enter a "while more events available" loop.
@@ -1393,7 +1428,17 @@ def processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,con
                 retryCount = 0 # after successful event-retrieval, reset count of retries
                 if (nextLink != None) and (pageNum >= 0) and (increment > 0):
                     pageNum += increment
-                    nextLink = changePageInURL(nextLink,pageNum)
+                    effectivePageNum = pageNum
+                    sinceTime = None
+                    if (pageBatchSize != None):
+                        effectivePageNum = pageNum % pageBatchSize
+                        batchNumber = pageNum - effectivePageNum
+                        if (batchNumber != 0):
+                            batchIndex = "%s" % batchNumber
+                            while not (batchIndex in batchSinceTime):
+                                time.sleep(0.1); # should we give up after some time limit?
+                            sinceTime = batchSinceTime[batchIndex]
+                    nextLink = changePageInURL(nextLink,effectivePageNum,sinceTime)
         except (IOError, TypeError) as e:
             # should log exact error for debugging purposes
             if (retryCount < 3):
@@ -1467,7 +1512,7 @@ def processAllAccounts(authFilenameList,threadCount):
                     thread = ParallelThread(threadIndex + 1, threadCount, args)
                     thread.start()
                     threadIndex += 1
-                thread = QueueOutputThread(credential,credentialList,configFilename)
+                thread = QueueOutputThread(credential,credentialList,configFilename,apiCon)
                 thread.start()
             else:
                 processEventBatches(apiCon,credential,timestampMap,credentialList,configFilename)
@@ -1518,35 +1563,44 @@ class ParallelThread(threading.Thread):
 
 
 class QueueOutputThread(threading.Thread):
-    def __init__(self, credential, credentialList, configFilename):
+    def __init__(self, credential, credentialList, configFilename, api_con):
         threading.Thread.__init__(self)
         self.credential = credential
         self.credentialList = credentialList
         self.configFilename = configFilename
+        self.api_con = api_con
 
     def run(self):
-        global threadList, outputQueue, shouldExit, configFilename
+        global threadList, outputQueue, shouldExit, configFilename, pageBatchSize, batchSinceTime
         pageNum = 1
         lastTimestamp = None
         # print >>sys.stderr, threadList
         while (len(threadList) > 0) or (len(outputQueue) > 0) and (not shouldExit):
             key = "%d" % pageNum
-            if (key in outputQueue):
-                tmpTimestamp = internalDumpEvents(outputQueue[key])
-                outputQueue.pop(key,None)
+            page = outputQueue.pop(key,None)
+            if (page != None):
+                tmpTimestamp = internalDumpEvents(page,self.api_con)
                 pageNum += 1
                 if (tmpTimestamp != None):
                     lastTimestamp = tmpTimestamp
                     self.credential['timestamp'] = lastTimestamp
                     writeTimestamp(self.configFilename, self.credentialList)
+                    if ((pageNum % pageBatchSize) == 0):
+                        timeObj = cputils.strToDate(lastTimestamp)
+                        if (timeObj != None):
+                            delta = datetime.timedelta(0,1,0) # one millisecond
+                            newTimeObj = timeObj + delta
+                            lastTimestamp = cputils.formatTimeAsISO8601(newTimeObj)
+                        print >>sys.stderr, "**Starting new batch at %s" % lastTimestamp
+                        batchSinceTime["%d" % pageNum] = lastTimestamp
             else:
                 time.sleep(0.1)
         # print >>sys.stderr, "Exiting queue consumer thead"
         if (not shouldExit) and (lastTimestamp != None):
             timeObj = cputils.strToDate(lastTimestamp)
             if (timeObj != None):
-                oneMicrosecond = datetime.timedelta(0,0,1)
-                newTimeObj = timeObj + oneMicrosecond
+                delta = datetime.timedelta(0,1,0) # one millisecond
+                newTimeObj = timeObj + delta
                 lastTimestamp = cputils.formatTimeAsISO8601(newTimeObj)
             self.credential['timestamp'] = lastTimestamp
             writeTimestamp(self.configFilename, self.credentialList)
