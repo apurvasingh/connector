@@ -22,13 +22,13 @@ import os.path
 import json
 
 # Here, we simultaneously check for which OS (all non-Windows OSs are treated equally) we have.
-#isWindows = True
-#if (platform.system() != "Windows"):
-#    isWindows = False
-#    import cpsyslog
-#    if sys.stdout.encoding == None:
-#        # this indicates we're sending to a pipe, and need to force terminal encoding
-#        sys.stdout = codecs.getwriter(locale.getpreferredencoding())(sys.stdout)
+isWindows = True
+if (platform.system() != "Windows"):
+    isWindows = False
+    import cpsyslog
+    if sys.stdout.encoding == None:
+        # this indicates we're sending to a pipe, and need to force terminal encoding
+        sys.stdout = codecs.getwriter(locale.getpreferredencoding())(sys.stdout)
 
 # Now we check for whether the extra modules needed for syslog functionality are present.
 syslogAvailable = True
