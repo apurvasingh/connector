@@ -95,6 +95,8 @@ threadCount = 0
 outputQueue = {}
 threadList = {}
 showProgress = False
+duplicateDebug = False
+eventIdMap = {}
 
 # tells program to reset page number after this many pages (and use "since" argument)
 pageBatchSize = None
@@ -386,7 +388,7 @@ def processCmdLineArgs(argv):
     global oneEventPerLine, verbose, outputFormat, outputDestination, lastTimestamp, configDir, syslogInfo
     global redis_host, redis_port, metadataDestination, useHA, apiURL, apiPort
     global botoAvailable, configOnS3, bucketName, eventCountLimit, batchWaitTime
-    global threadCount, showProgress, pageBatchSize
+    global threadCount, showProgress, pageBatchSize, duplicateDebug
     argsOK = True
     for arg in argv:
         if ((arg == '-?') or (arg == "-h")):
@@ -454,14 +456,16 @@ def processCmdLineArgs(argv):
                 argsOK = False
         elif (arg == "--progress"):
             showProgress = True
+        elif (arg == "--duplicates") or (arg == "--duplicate"):
+            duplicateDebug = True
         elif (arg.startswith('--batchsize=')):
             try:
                 pageBatchSize = int(arg.split('=')[1])
-                if (pageBatchSize < 1):
-                    print >> sys.stderr, "Illegal page batch size: %d (must be 1 or higher)" % pageBatchSize
+                if (pageBatchSize < 1) or (pageBatchSize > 100):
+                    print >> sys.stderr, "Illegal page batch size: %d (must be between 1 and 100)" % pageBatchSize
                     argsOK = False
             except ValueError:
-                print >> sys.stderr, "Invalid threads value: %s" % arg.split('=')[1]
+                print >> sys.stderr, "Invalid page batch size: %s (must be positive integer)" % arg.split('=')[1]
                 argsOK = False
         elif (arg.startswith('--jsonfile=')):
             outputFormat = 'json-file'
@@ -1171,7 +1175,7 @@ def dumpEvents(json_str):
     return (nextLink, lastTimestamp)
 
 
-def internalDumpEvents(eventList,apiCon = None):
+def internalDumpEvents(eventList, apiCon = None, pageNum = None):
     """ Parses a JSON response to the request for an event batch.
 
         The requests contains an outer wrapper object, with pagination info
@@ -1193,13 +1197,31 @@ def internalDumpEvents(eventList,apiCon = None):
         lastEvent = eventList[numEvents - 1]
         if (timestampKey in lastEvent):
             lastTimestamp = lastEvent[timestampKey]
+        if (duplicateDebug):
+            for event in eventList:
+                if ('id' in event):
+                    eventID = event['id']
+                    if (eventID in eventIdMap):
+                        # duplicate! dump relevant info
+                        pageNumStr = "??"
+                        if (pageNum != None):
+                            pageNumStr = str(pageNum)
+                        record = eventIdMap[eventID]
+                        record['count'] += 1
+                        print >>sys.stderr, "Duplicate event: id=%s time=%s page=%s count=%d" % (eventID, event[timestampKey], pageNumStr, record['count'])
+                    else:
+                        record = { 'id': eventID, 'time': event[timestampKey], 'count': 1 }
+                        eventIdMap[eventID] = record
     if (showProgress):
         now = datetime.datetime.utcnow()
         if (apiCon != None):
             (api_count, api_time) = apiCon.getTimeLog()
         else:
             (api_count, api_time) = (0, 0.0)
-        print >>sys.stderr, "%s   %d  %g/%d=%g" % ( now, totalEventCount, api_time, api_count, (api_time / api_count) )
+        avgTime = 0.0
+        if (api_count != 0):
+            avgTime = api_time / api_count
+        print >>sys.stderr, "%s   %d  %g/%d=%g" % ( now, totalEventCount, api_time, api_count, avgTime )
     if useHA:
         writeToRedis(eventList)
     else:
@@ -1362,7 +1384,7 @@ def processEventBatches(apiCon,credential,timestampMap,credentialList,configFile
 
 
 def processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,configFilename,start,increment):
-    global shouldExit, eventCountLimit, batchWaitTime, pageBatchSize, batchSinceTime
+    global shouldExit, eventCountLimit, batchWaitTime, pageBatchSize, batchSinceTime, lastTimestamp
     (apiCon.key_id, apiCon.secret) = (credential['id'], credential['secret'])
 
     # Check that we have a key and secret. Must be obtained either in an auth file,
@@ -1431,8 +1453,8 @@ def processEventBatchesByPages(apiCon,credential,timestampMap,credentialList,con
                     effectivePageNum = pageNum
                     sinceTime = None
                     if (pageBatchSize != None):
-                        effectivePageNum = pageNum % pageBatchSize
-                        batchNumber = pageNum - effectivePageNum
+                        effectivePageNum = (pageNum % pageBatchSize) + 1
+                        batchNumber = pageNum - (effectivePageNum - 1)
                         if (batchNumber != 0):
                             batchIndex = "%s" % batchNumber
                             while not (batchIndex in batchSinceTime):
@@ -1579,7 +1601,7 @@ class QueueOutputThread(threading.Thread):
             key = "%d" % pageNum
             page = outputQueue.pop(key,None)
             if (page != None):
-                tmpTimestamp = internalDumpEvents(page,self.api_con)
+                tmpTimestamp = internalDumpEvents(page,self.api_con,pageNum)
                 pageNum += 1
                 if (tmpTimestamp != None):
                     lastTimestamp = tmpTimestamp
