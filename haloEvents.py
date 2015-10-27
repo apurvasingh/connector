@@ -127,7 +127,7 @@ leefFieldMapping = {
     "rule_name": "policy",
     "created_at": "devTime"
 }
-# Use this mapping to prevent 
+# Use this mapping to prevent
 leefFieldMappingDouble = {
     "actor_username": "usrName",
     "server_ip_address": "dst",
@@ -234,6 +234,35 @@ leefCategoriesByName = {
     "file integrity re-baseline": "File Integrity Scanning Management",
     "ghostports login success": "GhostPorts",
     "automatic file integrity scanning disabled": "File Integrity Scanning Management",
+    "agent registration key regenerated": "Halo Daemon Management",
+    "daemon settings modified": "Halo Daemon Management",
+    "file integrity change detected": "Server Events",
+    "halo api authentication failure": "Halo Users and Authentication",
+    "halo api authentication success": "Halo Users and Authentication",
+    "halo session timeout modified": "Halo Users and Authentication",
+    "halo user deleted": "Halo Users and Authentication",
+    "local account activation requested": "Server Access Management",
+    "local account creation requested": "Server Access Management",
+    "local account deactivation requested": "Server Access Management",
+    "local account modification requested": "Server Access Management",
+    "local account ssh keys update requested": "Server Access Management",
+    "log-based intrusion detection disabled": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection enabled": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection policy assigned": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection policy created": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection policy deleted": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection policy exported": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection policy modified": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection policy unassigned": "Log-based Intrusion Detection Management",
+    "log-based intrusion detection rule matched": "Server Events",
+    "multiple root accounts detected (linux only)": "Server Events",
+    "portal audit policy modified": "Halo Portal Management",
+    "server group added": "Halo Daemon Management",
+    "server group deleted": "Halo Daemon Management",
+    "server group moved": "Halo Daemon Management",
+    "software vulnerability exception created": "Software Vulnerability Assessment Management",
+    "software vulnerability exception deleted": "Software Vulnerability Assessment Management",
+    "software vulnerability exception expired": "Software Vulnerability Assessment Management",
 }
 
 # constants used for CEF output
@@ -985,7 +1014,7 @@ def isKeyValueInSet(obj, key, values):
 
 def convertLeefTimestamp(timestamp):
     # convert from "2012-07-11T17:53:16.828169Z" to "2012-07-11T17:53:16.828"
-    # also handles shorter input like 
+    # also handles shorter input like
     if (len(timestamp) <= 27) and (len(timestamp) >= 24):
         return timestamp[0:23]
     else:
